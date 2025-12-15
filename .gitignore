@@ -1,0 +1,39 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Secrets / credentials
+*.key
+*.pem
+*.p12
+*.json
+
+# Go build output
+/bin/
+/dist/
+/build/
+*.exe
+*.out
+
+# Go test cache
+.coverage
+*.coverprofile
+
+# Go workspace
+/go.work
+/go.work.sum
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/

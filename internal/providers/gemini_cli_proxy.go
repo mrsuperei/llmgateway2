@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -23,100 +24,125 @@ import (
 	"github.com/yourorg/llm-proxy-gateway/internal/store"
 )
 
-// Gemini HTTP adapter
+// Gemini Direct OAuth Adapter
 //
-// This adapter uses OAuth tokens stored in Postgres and calls the Gemini
-// Generative Language API over HTTP (no subprocess/CLI).
+// This adapter calls the Google Generative Language API directly using OAuth tokens
+// (the same way the Gemini CLI does internally), without needing to run the CLI.
 //
-// Provider key is kept as "gemini_cli" to remain compatible with the starter DB schema
-// and OAuth UI flow, but the implementation is pure HTTP.
+// API endpoint: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+// Auth: OAuth 2.0 bearer token in Authorization header
 
-type GeminiHTTPAdapter struct {
+type GeminiDirectAdapter struct {
 	log zerolog.Logger
 	st  *store.Store
 	rl  *ratelimit.Service
 	cfg config.Config
 
 	httpClient *http.Client
+	// Base URL for Gemini API (generativelanguage.googleapis.com)
+	apiBaseURL string
 }
 
-func NewGeminiHTTPAdapter(log zerolog.Logger, st *store.Store, cfg config.Config) Provider {
-	return &GeminiHTTPAdapter{
+func NewGeminiDirectAdapter(log zerolog.Logger, st *store.Store, cfg config.Config) Provider {
+	// Use the official Generative Language API endpoint
+	apiBase := getEnvOrDefault("GEMINI_API_BASE_URL", "https://cloudcode-pa.googleapis.com")
+
+	return &GeminiDirectAdapter{
 		log:        log,
 		st:         st,
 		rl:         ratelimit.New(st),
 		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		apiBaseURL: apiBase,
+		httpClient: &http.Client{Timeout: 120 * time.Second},
 	}
 }
 
-func (g *GeminiHTTPAdapter) Key() string { return "gemini_cli" }
+func (g *GeminiDirectAdapter) Key() string { return "gemini_cli" }
 
-func (g *GeminiHTTPAdapter) ListModels(ctx context.Context, userID string) ([]openai.ModelEntry, error) {
-	// Best effort: call the models list endpoint; fall back to a small curated list.
+func (g *GeminiDirectAdapter) ListModels(ctx context.Context, userID string) ([]openai.ModelEntry, error) {
 	token, _, err := g.loadAccessToken(ctx, userID, "gemini-2.5-pro")
 	if err != nil {
 		return []openai.ModelEntry{
 			{ID: "gemini-2.5-pro", Object: "model", OwnedBy: "google"},
 			{ID: "gemini-2.5-flash", Object: "model", OwnedBy: "google"},
+			{ID: "gemini-2.0-flash", Object: "model", OwnedBy: "google"},
 		}, nil
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, "GET", "https://generativelanguage.googleapis.com/v1beta/models", nil)
+	// List models via API
+	url := fmt.Sprintf("%s/v1beta/models", g.apiBaseURL)
+	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := g.httpClient.Do(req)
 	if err != nil {
-		return []openai.ModelEntry{{ID: "gemini-2.5-pro", Object: "model", OwnedBy: "google"}}, nil
+		g.log.Warn().Err(err).Msg("failed to list models")
+		return g.fallbackModels(), nil
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode >= 300 {
-		return []openai.ModelEntry{{ID: "gemini-2.5-pro", Object: "model", OwnedBy: "google"}}, nil
+		g.log.Warn().Int("status", resp.StatusCode).Msg("list models returned error")
+		return g.fallbackModels(), nil
 	}
+
 	var payload struct {
 		Models []struct {
-			Name string `json:"name"`
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName,omitempty"`
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return []openai.ModelEntry{{ID: "gemini-2.5-pro", Object: "model", OwnedBy: "google"}}, nil
+		return g.fallbackModels(), nil
 	}
 
 	out := make([]openai.ModelEntry, 0, len(payload.Models))
 	for _, m := range payload.Models {
+		// Model name format: "models/gemini-2.5-pro"
 		id := strings.TrimPrefix(m.Name, "models/")
-		if id == "" {
+		if id == "" || !strings.HasPrefix(id, "gemini-") {
 			continue
 		}
-		out = append(out, openai.ModelEntry{ID: id, Object: "model", OwnedBy: "google"})
+		out = append(out, openai.ModelEntry{
+			ID:      id,
+			Object:  "model",
+			OwnedBy: "google",
+		})
 	}
+
 	if len(out) == 0 {
-		out = []openai.ModelEntry{{ID: "gemini-2.5-pro", Object: "model", OwnedBy: "google"}}
+		return g.fallbackModels(), nil
 	}
 	return out, nil
 }
 
-func (g *GeminiHTTPAdapter) ChatCompletions(ctx context.Context, userID string, req openai.ChatCompletionsRequest) (openai.ChatCompletionsResponse, error) {
+func (g *GeminiDirectAdapter) ChatCompletions(ctx context.Context, userID string, req openai.ChatCompletionsRequest) (openai.ChatCompletionsResponse, error) {
 	token, credID, err := g.loadAccessToken(ctx, userID, req.Model)
 	if err != nil {
 		return openai.ChatCompletionsResponse{}, err
 	}
 
-	// rate limit per credential
+	// Rate limit check
 	if err := g.rl.Allow(ctx, credID); err != nil {
 		return openai.ChatCompletionsResponse{}, err
 	}
 
-	gemReq := openAIToGemini(req)
+	// Convert OpenAI format to Gemini format
+	gemReq := g.buildGenerateContentRequest(req)
+
+	// Call Gemini API
 	raw, err := g.callGenerateContent(ctx, token, req.Model, gemReq)
 	if err != nil {
 		return openai.ChatCompletionsResponse{}, err
 	}
-	assistant, err := geminiExtractText(raw)
+
+	// Extract response
+	assistant, err := g.extractTextFromResponse(raw)
 	if err != nil {
 		return openai.ChatCompletionsResponse{}, err
 	}
 
+	// Build OpenAI-compatible response
 	now := time.Now().Unix()
 	resp := openai.ChatCompletionsResponse{
 		ID:      "chatcmpl_gemini_" + randID(),
@@ -142,39 +168,41 @@ func (g *GeminiHTTPAdapter) ChatCompletions(ctx context.Context, userID string, 
 	return resp, nil
 }
 
-func (g *GeminiHTTPAdapter) ChatCompletionsStream(ctx context.Context, userID string, req openai.ChatCompletionsRequest, emit func(any) error) error {
+func (g *GeminiDirectAdapter) ChatCompletionsStream(ctx context.Context, userID string, req openai.ChatCompletionsRequest, emit func(any) error) error {
 	token, credID, err := g.loadAccessToken(ctx, userID, req.Model)
 	if err != nil {
 		return err
 	}
+
 	if err := g.rl.Allow(ctx, credID); err != nil {
 		return err
 	}
 
-	gemReq := openAIToGemini(req)
+	gemReq := g.buildGenerateContentRequest(req)
 
-	// Use Gemini streaming endpoint and translate each chunk to OpenAI SSE chunks.
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent", req.Model)
+	// Use streaming endpoint
+	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", g.apiBaseURL, req.Model)
 	body, _ := json.Marshal(gemReq)
+
 	httpReq, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
 
 	httpResp, err := g.httpClient.Do(httpReq)
 	if err != nil {
-		return err
+		return fmt.Errorf("stream request failed: %w", err)
 	}
 	defer httpResp.Body.Close()
+
 	if httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
-		return fmt.Errorf("gemini http error: %s body=%s", httpResp.Status, string(b))
+		return fmt.Errorf("gemini api error: %s body=%s", httpResp.Status, string(b))
 	}
 
 	created := time.Now().Unix()
 	id := "chatcmpl_gemini_" + randID()
-	// Gemini stream is typically JSON per line/event. We parse line-by-line and emit deltas.
-	// We keep a best-effort implementation to match the starter's streaming contract.
+
+	// Parse SSE stream
 	scanner := bufio.NewScanner(httpResp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -183,18 +211,25 @@ func (g *GeminiHTTPAdapter) ChatCompletionsStream(ctx context.Context, userID st
 		if ln == "" {
 			continue
 		}
-		// Some deployments prefix with "data:" when using SSE.
+
+		// SSE format: "data: {...}"
+		if !strings.HasPrefix(ln, "data:") {
+			continue
+		}
 		ln = strings.TrimPrefix(ln, "data:")
 		ln = strings.TrimSpace(ln)
+
 		if ln == "[DONE]" {
 			break
 		}
 
-		// Each event can be a partial GenerateContentResponse-like structure.
-		txt, _ := geminiExtractText([]byte(ln))
+		// Extract text from chunk
+		txt, _ := g.extractTextFromResponse([]byte(ln))
 		if txt == "" {
 			continue
 		}
+
+		// Emit OpenAI-format chunk
 		if err := emit(map[string]any{
 			"id":      id,
 			"object":  "chat.completion.chunk",
@@ -208,9 +243,12 @@ func (g *GeminiHTTPAdapter) ChatCompletionsStream(ctx context.Context, userID st
 			return err
 		}
 	}
+
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+
+	// Send final chunk
 	return emit(map[string]any{
 		"id":      id,
 		"object":  "chat.completion.chunk",
@@ -224,95 +262,93 @@ func (g *GeminiHTTPAdapter) ChatCompletionsStream(ctx context.Context, userID st
 	})
 }
 
-// --- HTTP + OAuth helpers ---
+// --- OAuth and Token Management ---
 
-func (g *GeminiHTTPAdapter) oauthConfig() *oauth2.Config {
+func (g *GeminiDirectAdapter) oauthConfig() *oauth2.Config {
 	return &oauth2.Config{
 		ClientID:     g.cfg.GoogleClientID,
 		ClientSecret: g.cfg.GoogleClientSecret,
 		Endpoint:     google.Endpoint,
-		// scopes are not strictly required for refresh, but kept aligned with the login flow.
 		Scopes: []string{
 			"openid",
 			"email",
 			"profile",
-			"https://www.googleapis.com/auth/generative-language",
+			"https://www.googleapis.com/auth/generative-language.tuning",
+			"https://www.googleapis.com/auth/generative-language.retriever",
 		},
 		RedirectURL: g.cfg.GoogleRedirectURL,
 	}
 }
 
-// loadAccessToken selects a credential and returns a valid access token.
-// If the stored token is expired and refreshable, it will be refreshed and persisted.
-func (g *GeminiHTTPAdapter) loadAccessToken(ctx context.Context, userID, model string) (accessToken string, credentialID string, err error) {
+func (g *GeminiDirectAdapter) loadAccessToken(ctx context.Context, userID, model string) (accessToken string, credentialID string, err error) {
 	cred, err := g.st.Credentials().SelectCredentialForModel(ctx, userID, g.Key(), model)
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("no credentials found: %w", err)
 	}
 	if cred.CredentialType != "oauth2" {
 		return "", "", errors.New("gemini requires oauth2 credential; got: " + cred.CredentialType)
 	}
+
 	tok, err := auth.TokenFromJSON([]byte(cred.OAuthTokenJSON))
 	if err != nil {
 		return "", "", errors.New("invalid stored oauth token json")
 	}
 
-	// Refresh if needed and persist.
+	// Auto-refresh if needed
 	ts := g.oauthConfig().TokenSource(ctx, tok)
 	newTok, err := ts.Token()
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("token refresh failed: %w", err)
 	}
-	// Persist only if changed.
+
+	// Persist if changed
 	if newTok.AccessToken != tok.AccessToken || !newTok.Expiry.Equal(tok.Expiry) {
-		_ = g.st.Credentials().UpdateOAuthToken(ctx, cred.ID, newTok)
+		if err := g.st.Credentials().UpdateOAuthToken(ctx, cred.ID, newTok); err != nil {
+			g.log.Warn().Err(err).Msg("failed to update token")
+		}
 	}
+
 	return newTok.AccessToken, cred.ID, nil
 }
 
-func (g *GeminiHTTPAdapter) callGenerateContent(ctx context.Context, accessToken, model string, payload any) ([]byte, error) {
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", model)
+// --- API Calls ---
+
+func (g *GeminiDirectAdapter) callGenerateContent(ctx context.Context, accessToken, model string, payload any) ([]byte, error) {
+	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent", g.apiBaseURL, model)
 	body, _ := json.Marshal(payload)
 
-	r, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-	r.Header.Set("Authorization", "Bearer "+accessToken)
-	r.Header.Set("Content-Type", "application/json")
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := g.httpClient.Do(r)
+	resp, err := g.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("api request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("gemini http error: %s body=%s", resp.Status, string(b))
+		return nil, fmt.Errorf("gemini api error: %s body=%s", resp.Status, string(b))
 	}
 	return b, nil
 }
 
-// --- request/response mapping ---
+// --- Request/Response Mapping ---
 
-type geminiGenerateContentRequest struct {
-	Contents []struct {
-		Role  string `json:"role,omitempty"`
-		Parts []struct {
-			Text string `json:"text,omitempty"`
-		} `json:"parts"`
-	} `json:"contents"`
+type geminiContent struct {
+	Role  string `json:"role,omitempty"`
+	Parts []struct {
+		Text string `json:"text,omitempty"`
+	} `json:"parts"`
 }
 
-func openAIToGemini(req openai.ChatCompletionsRequest) geminiGenerateContentRequest {
-	// Gemini expects a list of "contents". We'll map OpenAI messages:
-	// system -> user (prefixed)
-	// user -> user
-	// assistant -> model
-	var contents []struct {
-		Role  string `json:"role,omitempty"`
-		Parts []struct {
-			Text string `json:"text,omitempty"`
-		} `json:"parts"`
-	}
+type geminiGenerateContentRequest struct {
+	Contents []geminiContent `json:"contents"`
+}
+
+func (g *GeminiDirectAdapter) buildGenerateContentRequest(req openai.ChatCompletionsRequest) geminiGenerateContentRequest {
+	var contents []geminiContent
 
 	for _, m := range req.Messages {
 		role := strings.ToLower(m.Role)
@@ -321,7 +357,7 @@ func openAIToGemini(req openai.ChatCompletionsRequest) geminiGenerateContentRequ
 		case "assistant":
 			gRole = "model"
 		case "system":
-			gRole = "user"
+			gRole = "user" // System messages treated as user messages
 		default:
 			gRole = "user"
 		}
@@ -331,10 +367,10 @@ func openAIToGemini(req openai.ChatCompletionsRequest) geminiGenerateContentRequ
 		case string:
 			text = v
 		default:
-			// best effort
 			j, _ := json.Marshal(v)
 			text = string(j)
 		}
+
 		if role == "system" {
 			text = "[system] " + text
 		}
@@ -342,12 +378,7 @@ func openAIToGemini(req openai.ChatCompletionsRequest) geminiGenerateContentRequ
 			continue
 		}
 
-		contents = append(contents, struct {
-			Role  string `json:"role,omitempty"`
-			Parts []struct {
-				Text string `json:"text,omitempty"`
-			} `json:"parts"`
-		}{
+		contents = append(contents, geminiContent{
 			Role: gRole,
 			Parts: []struct {
 				Text string `json:"text,omitempty"`
@@ -358,8 +389,8 @@ func openAIToGemini(req openai.ChatCompletionsRequest) geminiGenerateContentRequ
 	return geminiGenerateContentRequest{Contents: contents}
 }
 
-func geminiExtractText(raw []byte) (string, error) {
-	// Gemini response shape (v1beta):
+func (g *GeminiDirectAdapter) extractTextFromResponse(raw []byte) (string, error) {
+	// Gemini response format:
 	// {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
 	var parsed struct {
 		Candidates []struct {
@@ -379,6 +410,23 @@ func geminiExtractText(raw []byte) (string, error) {
 	return strings.TrimSpace(parsed.Candidates[0].Content.Parts[0].Text), nil
 }
 
+// --- Helpers ---
+
+func (g *GeminiDirectAdapter) fallbackModels() []openai.ModelEntry {
+	return []openai.ModelEntry{
+		{ID: "gemini-2.5-pro", Object: "model", OwnedBy: "google"},
+		{ID: "gemini-2.5-flash", Object: "model", OwnedBy: "google"},
+		{ID: "gemini-2.0-flash", Object: "model", OwnedBy: "google"},
+	}
+}
+
 func randID() string {
 	return strings.ReplaceAll(time.Now().Format("20060102150405.000000000"), ".", "")
+}
+
+func getEnvOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

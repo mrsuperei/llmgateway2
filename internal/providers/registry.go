@@ -9,7 +9,6 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/yourorg/llm-proxy-gateway/internal/config"
-
 	"github.com/yourorg/llm-proxy-gateway/internal/openai"
 	"github.com/yourorg/llm-proxy-gateway/internal/routing"
 	"github.com/yourorg/llm-proxy-gateway/internal/store"
@@ -34,10 +33,11 @@ func NewRegistry(log zerolog.Logger, st *store.Store, cfg any) *Registry {
 
 	// Register adapters here
 	if c, ok := cfg.(config.Config); ok {
-		r.adpts["gemini_cli"] = NewGeminiHTTPAdapter(log, st, c)
+		// Use direct API adapter (no CLI subprocess needed)
+		r.adpts["gemini_cli"] = NewGeminiDirectAdapter(log, st, c)
 	} else {
-		// fallback: zero config; OAuth refresh may not work without client id/secret
-		r.adpts["gemini_cli"] = NewGeminiHTTPAdapter(log, st, config.Config{})
+		// fallback: zero config
+		r.adpts["gemini_cli"] = NewGeminiDirectAdapter(log, st, config.Config{})
 	}
 	r.adpts["openai"] = NewOpenAIStubAdapter(log, st)       // placeholder
 	r.adpts["anthropic"] = NewAnthropicStubAdapter(log, st) // placeholder

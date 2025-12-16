@@ -16,20 +16,20 @@ import (
 	"github.com/yourorg/llm-proxy-gateway/internal/store"
 )
 
-// NOTE: This is a standard OAuth2 authorization-code flow.
-// We bind the resulting token to the user identified by the provided gateway api key (lookup via DB).
-//
-// Scopes: for a CLI-proxy the exact scopes may vary. For a starter, we request "openid email" plus
-// a generic cloud scope. Adjust per Gemini CLI / Google requirements later.
+// OAuth2 config for Gemini Generative Language API
+// Uses the same scopes as the Gemini CLI
 func googleOAuthConfig(cfg config.Config) *oauth2.Config {
 	return &oauth2.Config{
 		ClientID:     cfg.GoogleClientID,
 		ClientSecret: cfg.GoogleClientSecret,
 		RedirectURL:  cfg.GoogleRedirectURL,
 		Scopes: []string{
-			"https://www.googleapis.com/auth/cloud-platform",
-			"https://www.googleapis.com/auth/userinfo.email",
-			"https://www.googleapis.com/auth/userinfo.profile",
+			"openid",
+			"email",
+			"profile",
+			// Gemini-specific scopes (required for CLI API access)
+			"https://www.googleapis.com/auth/generative-language.tuning",
+			"https://www.googleapis.com/auth/generative-language.retriever",
 		},
 		Endpoint: google.Endpoint,
 	}
@@ -97,8 +97,10 @@ func OAuthCallback(cfg config.Config, st *store.Store, logger zerolog.Logger) ht
 		}
 
 		_, _ = w.Write([]byte(
-			"Login OK.\n" +
-				"You can close this tab and use /v1/chat/completions with model gemini-...\n",
+			"✅ Login OK!\n\n" +
+				"Je OAuth tokens zijn opgeslagen.\n" +
+				"Je kunt nu /v1/chat/completions gebruiken met model prefix 'gemini-'\n\n" +
+				"Je kunt dit tabblad sluiten.\n",
 		))
 	}
 }
@@ -111,7 +113,7 @@ func randomState(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// A tiny helper to encode oauth2.Token to JSON consistently.
+// Helper functions for token serialization
 func tokenToJSON(tok *oauth2.Token) ([]byte, error) {
 	return json.Marshal(tok)
 }
@@ -121,7 +123,6 @@ func tokenFromJSON(b []byte) (*oauth2.Token, error) {
 	if err := json.Unmarshal(b, &tok); err != nil {
 		return nil, err
 	}
-	// oauth2.Token has Expiry; ensure monotonic stripped by round-trip
 	tok.Expiry = tok.Expiry.UTC()
 	return &tok, nil
 }

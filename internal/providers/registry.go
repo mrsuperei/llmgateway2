@@ -33,11 +33,11 @@ func NewRegistry(log zerolog.Logger, st *store.Store, cfg any) *Registry {
 
 	// Register adapters here
 	if c, ok := cfg.(config.Config); ok {
-		// Use direct API adapter (no CLI subprocess needed)
-		r.adpts["gemini_cli"] = NewGeminiDirectAdapter(log, st, c)
+		// Use CLI adapter (unofficial CLI endpoints)
+		r.adpts["gemini_cli"] = NewGeminiCLIAdapter(log, st, c)
 	} else {
 		// fallback: zero config
-		r.adpts["gemini_cli"] = NewGeminiDirectAdapter(log, st, config.Config{})
+		r.adpts["gemini_cli"] = NewGeminiCLIAdapter(log, st, config.Config{})
 	}
 	r.adpts["openai"] = NewOpenAIStubAdapter(log, st)       // placeholder
 	r.adpts["anthropic"] = NewAnthropicStubAdapter(log, st) // placeholder

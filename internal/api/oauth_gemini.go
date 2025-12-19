@@ -16,20 +16,18 @@ import (
 	"github.com/yourorg/llm-proxy-gateway/internal/store"
 )
 
-// OAuth2 config for Gemini Generative Language API
-// Uses the same scopes as the Gemini CLI
+// OAuth2 config for Gemini CLI API
+// Uses standard Google scopes (no special Gemini scopes needed)
 func googleOAuthConfig(cfg config.Config) *oauth2.Config {
 	return &oauth2.Config{
 		ClientID:     cfg.GoogleClientID,
 		ClientSecret: cfg.GoogleClientSecret,
 		RedirectURL:  cfg.GoogleRedirectURL,
+		// Standard Google OAuth scopes - same as CLI uses
 		Scopes: []string{
 			"openid",
-			"email",
-			"profile",
-			// Gemini-specific scopes (required for CLI API access)
-			"https://www.googleapis.com/auth/generative-language.tuning",
-			"https://www.googleapis.com/auth/generative-language.retriever",
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/userinfo.profile",
 		},
 		Endpoint: google.Endpoint,
 	}
